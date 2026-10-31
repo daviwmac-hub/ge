@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AR Mão">
+<title>AR Mão</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; touch-action:none;
+    -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
+    font-family:-apple-system, system-ui, sans-serif; color:#fff; }
+  #video, #gl { position:fixed; inset:0; width:100%; height:100%; }
+  #video { object-fit:cover; }
+  #cursor { position:fixed; left:0; top:0; width:26px; height:26px; border-radius:50%;
+    border:2px solid #fff; background:rgba(255,255,255,.4); pointer-events:none; display:none; z-index:5; }
+  #ui { position:fixed; inset:0; pointer-events:none; z-index:10;
+    padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom);
+    display:flex; flex-direction:column; justify-content:space-between; box-sizing:border-box; }
+  #top, #bottom { display:flex; flex-direction:column; gap:8px; padding:8px 0; }
+  #status { align-self:center; font-size:13px; padding:6px 12px; border-radius:99px;
+    background:rgba(0,0,0,.55); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); text-align:center; }
+  .row { display:flex; gap:8px; }
+  button { pointer-events:auto; flex:1; border:0; border-radius:12px; padding:11px 6px; font-size:13px; color:#fff;
+    background:rgba(40,40,40,.65); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+  button.on { background:#0a84ff; }
+  #bPhysics { font-size:17px; font-weight:600; padding:15px; background:#ff9f0a; color:#000; }
+  #bPhysics.active { background:#30d158; }
+  #floorRow { pointer-events:auto; display:flex; gap:10px; align-items:center; font-size:12px;
+    background:rgba(0,0,0,.5); border-radius:12px; padding:6px 12px; }
+  #floorRow input { flex:1; }
+  #start { position:fixed; inset:0; z-index:20; background:#000; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:16px; padding:24px; text-align:center; }
+  #start p { max-width:340px; font-size:14px; line-height:1.45; opacity:.85; margin:0; }
+  #startBtn { flex:none; width:220px; font-size:18px; font-weight:600; background:#0a84ff; padding:15px; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="gl"></canvas>
+<div id="cursor"></div>
+
+<div id="ui">
+  <div id="top">
+    <div id="status">Pronto</div>
+    <div class="row"><button id="mDraw" class="on">Desenhar</button><button id="mMan">Manipular</button></div>
+  </div>
+  <div id="bottom">
+    <div class="row">
+      <button id="bCube">Cubo</button><button id="bSphere">Esfera</button>
+      <button id="bFinal">Finalizar traço</button><button id="bClear">Limpar</button>
+    </div>
+    <label id="floorRow">Altura do chão <input id="floor" type="range" min="-1.5" max="-0.1" step="0.01" value="-0.7"></label>
+    <button id="bPhysics">Aplicar Física</button>
+  </div>
+</div>
+
+<div id="start">
+  <h1>AR Mão</h1>
+  <p>Aponte a câmera traseira para a sua mão. <b>Desenhar:</b> indicador esticado e polegar levantado. <b>Punho fechado</b> por 1 s vira sólido.
+     <b>Manipular:</b> pinça sobre um objeto para arrastar; afaste os dedos rápido para expandir. Segure o iPhone em pé.</p>
+  <button id="startBtn">Iniciar</button>
+</div>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import * as CANNON from "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js";
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+const video = $("video"), cursor = $("cursor"), statusEl = $("status");
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+
+let W = innerWidth, H = innerHeight;
+let lastStatus = "";
+const setStatus = t => { if (t !== lastStatus) { lastStatus = t; statusEl.textContent = t; } };
+
+/* ---------- Three.js (camada transparente sobre o vídeo) ---------- */
+const FOV = 60;
+const renderer = new THREE.WebGLRenderer({ canvas: $("gl"), alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(FOV, W / H, 0.05, 20);
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(1, 2, 1); scene.add(sun);
+
+function resize() {
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H, false);
+  camera.aspect = W / H; camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize); resize();
+
+/* ---------- Orientação do aparelho → rotação da câmera 3D ---------- */
+let orient = null;
+const Z_AXIS = new THREE.Vector3(0, 0, 1);
+const _e = new THREE.Euler(), _q0 = new THREE.Quaternion();
+const _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+const onOrient = e => { if (e.alpha != null) orient = e; };
+function updateCamera() {
+  if (!orient) return;
+  const d = THREE.MathUtils.degToRad;
+  const scr = d((screen.orientation && screen.orientation.angle) || window.orientation || 0);
+  _e.set(d(orient.beta), d(orient.alpha), -d(orient.gamma), "YXZ");
+  camera.quaternion.setFromEuler(_e).multiply(_q1).multiply(_q0.setFromAxisAngle(Z_AXIS, -scr));
+  camera.updateMatrixWorld(true);
+}
+
+/* ---------- Física (cannon-es) ---------- */
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.8, 0) });   // 9,8 m/s²
+world.defaultContactMaterial.friction = 0.6;
+world.defaultContactMaterial.restitution = 0.25;
+let physicsOn = false;
+let floorY = -0.7;
+const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
+floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+floorBody.position.set(0, floorY, 0);
+world.addBody(floorBody);
+const grid = new THREE.GridHelper(4, 16, 0x00ffff, 0x007777);
+grid.material.transparent = true; grid.material.opacity = 0.35; grid.position.y = floorY;
+scene.add(grid);
+
+$("floor").addEventListener("input", e => {
+  floorY = parseFloat(e.target.value);
+  floorBody.position.y = floorY; grid.position.y = floorY;
+  objects.forEach(o => o.body.wakeUp());
+});
+
+/* ---------- Objetos ---------- */
+const objects = [];          // {kind, mesh, body, size, scale}
+let selected = null, selectedAt = 0;
+
+function addObject(kind, pos) {
+  let mesh, body, size;
+  if (kind === "cube") {
+    size = 0.08;
+    mesh = new THREE.Mesh(new THREE.BoxGeometry(size, size, size), new THREE.MeshStandardMaterial({ color: 0xff8800, roughness: 0.4 }));
+    body = new CANNON.Body({ mass: 1, shape: new CANNON.Box(new CANNON.Vec3(size / 2, size / 2, size / 2)) });
+  } else {
+    size = 0.045;
+    mesh = new THREE.Mesh(new THREE.SphereGeometry(size, 24, 16), new THREE.MeshStandardMaterial({ color: 0xff3b9a, roughness: 0.25, metalness: 0.4 }));
+    body = new CANNON.Body({ mass: 1, shape: new CANNON.Sphere(size) });
+  }
+  body.position.set(pos.x, pos.y, pos.z);
+  body.linearDamping = 0.05; body.angularDamping = 0.05;
+  world.addBody(body); scene.add(mesh); mesh.position.copy(pos);
+  const o = { kind, mesh, body, size, scale: 1 };
+  objects.push(o); selected = o; selectedAt = lastT;
+  return o;
+}
+
+function setObjScale(o, s) {
+  if (o.kind === "rail") return;
+  s = clamp(s, 0.3, 4); o.scale = s; o.mesh.scale.setScalar(s);
+  const b = o.body;
+  b.shapes = []; b.shapeOffsets = []; b.shapeOrientations = [];
+  if (o.kind === "cube") { const h = o.size * s / 2; b.addShape(new CANNON.Box(new CANNON.Vec3(h, h, h))); }
+  else b.addShape(new CANNON.Sphere(o.size * s));
+  b.updateMassProperties(); b.updateBoundingRadius(); b.aabbNeedsUpdate = true; b.wakeUp();
+}
+
+function spawn(kind) {
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  const pos = camera.position.clone().addScaledVector(fwd, 0.45);
+  addObject(kind, pos);
+  setStatus(kind === "cube" ? "Cubo criado flutuando" : "Esfera criada flutuando");
+}
+
+/* ---------- Traço neon ---------- */
+let stroke = null, smoothTip = null, smoothDepth = 0.4, hue = 0.5;
+
+function segMesh(a, b, t, extra, color) {
+  const dir = b.clone().sub(a), len = dir.length() * extra;
+  const m = new THREE.Mesh(new THREE.BoxGeometry(t, t, len), new THREE.MeshBasicMaterial({ color, toneMapped: false }));
+  m.position.copy(a).add(b).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(Z_AXIS, dir.normalize());
+  return m;
+}
+function newStroke() {
+  const color = new THREE.Color().setHSL(hue, 1, 0.55); hue = (hue + 0.17) % 1;
+  const group = new THREE.Group(); scene.add(group);
+  stroke = { group, polylines: [[]], color, count: 0 };
+}
+function strokeAppend(p) {
+  const pl = stroke.polylines[stroke.polylines.length - 1], last = pl[pl.length - 1];
+  if (last) {
+    if (last.distanceTo(p) < 0.006 || stroke.count >= 800) return;
+    stroke.group.add(segMesh(last, p, 0.004, 1.15, stroke.color)); stroke.count++;
+  }
+  pl.push(p.clone());
+}
+function penUp() {
+  if (!stroke) return;
+  const pl = stroke.polylines;
+  if (pl[pl.length - 1].length) pl.push([]);
+}
+function decimate(pts, minD) {
+  const out = [];
+  for (const p of pts) if (!out.length || out[out.length - 1].distanceTo(p) >= minD) out.push(p);
+  if (pts.length && out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+  return out;
+}
+function finalizeStroke() {
+  if (!stroke) return;
+  const st = stroke; stroke = null; smoothTip = null;
+  scene.remove(st.group);
+  st.group.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  const lines = st.polylines.map(l => decimate(l, 0.02)).filter(l => l.length >= 2);
+  if (!lines.length) { setStatus("Traço curto demais"); return; }
+
+  const all = lines.flat(), center = new THREE.Vector3();
+  all.forEach(p => center.add(p)); center.divideScalar(all.length);
+  const group = new THREE.Group(); group.position.copy(center); scene.add(group);
+  const body = new CANNON.Body({ mass: 2 }), t = 0.016;
+
+  for (const line of lines) for (let i = 1; i < line.length; i++) {
+    const a = line[i - 1].clone().sub(center), b = line[i].clone().sub(center);
+    const dir = b.clone().sub(a), len = dir.length() + t;
+    const q = new THREE.Quaternion().setFromUnitVectors(Z_AXIS, dir.normalize());
+    const mid = a.clone().add(b).multiplyScalar(0.5);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(t, t, len), new THREE.MeshBasicMaterial({ color: st.color, toneMapped: false }));
+    m.position.copy(mid); m.quaternion.copy(q); group.add(m);
+    body.addShape(new CANNON.Box(new CANNON.Vec3(t / 2, t / 2, len / 2)),
+                  new CANNON.Vec3(mid.x, mid.y, mid.z), new CANNON.Quaternion(q.x, q.y, q.z, q.w));
+  }
+  body.position.set(center.x, center.y, center.z);
+  world.addBody(body);
+  objects.push({ kind: "rail", mesh: group, body, size: 1, scale: 1 });
+  setStatus("Traço convertido em sólido");
+}
+
+/* ---------- Mão (MediaPipe) → gestos ---------- */
+let handLandmarker = null, lastVideoTime = -1, frameN = 0;
+
+function processHand(lm) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return null;
+  const s = Math.max(W / vw, H / vh), ox = (vw * s - W) / 2, oy = (vh * s - H) / 2;   // object-fit: cover
+  const P = lm.map(p => ({ x: p.x * vw * s - ox, y: p.y * vh * s - oy }));
+  const d = (a, b) => Math.hypot(P[a].x - P[b].x, P[a].y - P[b].y);
+  const palm = d(0, 9);
+  if (palm < 8) return null;
+  const ext = (tip, mcp) => d(tip, 0) / Math.max(d(mcp, 0), 1);
+  const indexOut = ext(8, 5) > 1.6, midCurl = ext(12, 9) < 1.4, ringCurl = ext(16, 13) < 1.4, pinkCurl = ext(20, 17) < 1.4;
+  const thumbOut = d(4, 5) / palm > 0.75, thumbIn = d(4, 5) / palm < 0.6;
+  const fPx = (H / 2) / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+  return {
+    index: P[8],
+    pinch: { x: (P[4].x + P[8].x) / 2, y: (P[4].y + P[8].y) / 2 },
+    pinchRatio: d(4, 8) / palm,
+    drawPose: indexOut && midCurl && ringCurl && pinkCurl && thumbOut,
+    fist: !indexOut && midCurl && ringCurl && pinkCurl && thumbIn,
+    depth: clamp(fPx * 0.095 / palm, 0.18, 1.0)      // estimativa pelo tamanho da palma (~9,5 cm)
+  };
+}
+
+const rayDir = (sx, sy) =>
+  new THREE.Vector3(sx / W * 2 - 1, -(sy / H) * 2 + 1, 0.5).unproject(camera).sub(camera.position).normalize();
+const showCursor = (p, color) => {
+  cursor.style.display = "block";
+  cursor.style.transform = `translate(${p.x - 13}px, ${p.y - 13}px)`;
+  cursor.style.background = color;
+};
+
+let mode = "draw", lastT = 0, fistStart = null;
+let grabbed = null, grabDist = 0.4, wasPinching = false, lastRatio = 0;
+const grabTarget = new THREE.Vector3();
+
+function handle(h, t) {
+  const dt = Math.max(t - lastT, 0.001);
+  lastT = t;
+  if (!h) {
+    cursor.style.display = "none"; penUp(); smoothTip = null; fistStart = null;
+    if (wasPinching) endGrab(); wasPinching = false;
+    setStatus("Mostre uma mão para a câmera traseira");
+    return;
+  }
+  if (mode === "draw") doDraw(h, t); else doManip(h, t, dt);
+}
+
+function doDraw(h, t) {
+  if (grabbed) endGrab();
+  showCursor(h.index, h.drawPose ? "rgba(0,255,255,.5)" : "rgba(150,150,150,.5)");
+
+  if (h.fist) {                                     // punho 0,7 s → vira sólido
+    penUp(); smoothTip = null;
+    if (fistStart == null) fistStart = t;
+    if (t - fistStart > 0.7) { fistStart = null; finalizeStroke(); }
+    else setStatus("Segure o punho para virar sólido…");
+    return;
+  }
+  fistStart = null;
+
+  if (!h.drawPose) { penUp(); smoothTip = null; setStatus("Indicador esticado + polegar levantado para desenhar"); return; }
+
+  smoothDepth += (h.depth - smoothDepth) * 0.2;
+  const raw = camera.position.clone().addScaledVector(rayDir(h.index.x, h.index.y), smoothDepth);
+  smoothTip = smoothTip ? smoothTip.lerp(raw, 0.4) : raw;
+  if (!stroke) newStroke();
+  strokeAppend(smoothTip);
+  setStatus("Desenhando… (punho = finalizar)");
+}
+
+function beginGrab(pt) {
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  let best = null, bestD = 110;
+  for (const o of objects) {
+    const rel = o.mesh.position.clone().sub(camera.position);
+    if (rel.dot(fwd) <= 0) continue;
+    const v = o.mesh.position.clone().project(camera);
+    const dd = Math.hypot((v.x + 1) / 2 * W - pt.x, (1 - v.y) / 2 * H - pt.y);
+    if (dd < bestD) { bestD = dd; best = o; }
+  }
+  if (!best) return;
+  grabbed = best; selected = best;
+  grabDist = best.mesh.position.distanceTo(camera.position);
+  grabTarget.copy(best.mesh.position);
+}
+function endGrab() { if (grabbed) { grabbed.body.wakeUp(); selectedAt = lastT; grabbed = null; } }
+
+function doManip(h, t, dt) {
+  penUp();
+  const pinching = wasPinching ? h.pinchRatio < 0.55 : h.pinchRatio < 0.30;   // histerese
+  showCursor(h.pinch, pinching ? "rgba(48,209,88,.6)" : "rgba(255,255,255,.4)");
+
+  if (pinching) {
+    if (!wasPinching) beginGrab(h.pinch);
+    if (grabbed) {
+      grabTarget.copy(camera.position).addScaledVector(rayDir(h.pinch.x, h.pinch.y), grabDist);
+      setStatus("Arrastando objeto");
+    } else setStatus("Aproxime a pinça de um objeto");
+  } else {
+    if (wasPinching) endGrab();
+    if (selected && t - selectedAt < 1.2) {            // afastar dedos rápido = expandir
+      const v = (h.pinchRatio - lastRatio) / dt;
+      if (v > 2.0 && h.pinchRatio > 0.3) {
+        setObjScale(selected, selected.scale * (1 + Math.min(v * dt * 0.9, 0.3)));
+        setStatus("Expandindo objeto");
+      }
+    } else setStatus("Faça a pinça sobre um objeto para agarrar");
+  }
+  wasPinching = pinching; lastRatio = h.pinchRatio;
+}
+
+/* ---------- Escala por toque (2 dedos na tela) ---------- */
+let lastTouchDist = 0;
+document.addEventListener("touchmove", e => {
+  if (e.touches.length !== 2) return;
+  const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+  const o = selected || objects[objects.length - 1];
+  if (lastTouchDist && o) setObjScale(o, o.scale * d / lastTouchDist);
+  lastTouchDist = d;
+}, { passive: true });
+document.addEventListener("touchend", () => { lastTouchDist = 0; });
+
+/* ---------- Botões ---------- */
+function setMode(m) {
+  mode = m; $("mDraw").classList.toggle("on", m === "draw"); $("mMan").classList.toggle("on", m === "manipulate");
+  if (m === "manipulate") penUp();
+}
+$("mDraw").onclick = () => setMode("draw");
+$("mMan").onclick = () => setMode("manipulate");
+$("bCube").onclick = () => spawn("cube");
+$("bSphere").onclick = () => spawn("sphere");
+$("bFinal").onclick = finalizeStroke;
+
+$("bPhysics").onclick = () => {                      // "Aplicar Física"
+  physicsOn = true;
+  objects.forEach(o => o.body.wakeUp());
+  $("bPhysics").classList.add("active");
+  setStatus("Física ativa: gravidade 9,8 m/s²");
+};
+$("bClear").onclick = () => {
+  endGrab();
+  if (stroke) { scene.remove(stroke.group); stroke = null; smoothTip = null; }
+  objects.forEach(o => { scene.remove(o.mesh); world.removeBody(o.body); });
+  objects.length = 0; selected = null; physicsOn = false;
+  $("bPhysics").classList.remove("active");
+  setStatus("Cena limpa. Física desligada.");
+};
+
+/* ---------- Loop principal ---------- */
+let lastFrame = performance.now();
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  const dt = Math.min((now - lastFrame) / 1000, 0.05); lastFrame = now;
+  updateCamera();
+
+  if (handLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    if ((++frameN & 1) === 0) {                      // ~30 Hz, mantém o app leve
+      const res = handLandmarker.detectForVideo(video, now);
+      handle(res.landmarks && res.landmarks[0] ? processHand(res.landmarks[0]) : null, now / 1000);
+    }
+  }
+
+  if (grabbed) {                                      // segura o objeto agarrado "congelado" na mão
+    const b = grabbed.body;
+    b.position.x += (grabTarget.x - b.position.x) * 0.5;
+    b.position.y += (grabTarget.y - b.position.y) * 0.5;
+    b.position.z += (grabTarget.z - b.position.z) * 0.5;
+    b.velocity.setZero(); b.angularVelocity.setZero();
+  }
+  if (physicsOn) world.step(1 / 60, dt, 3);           // sem física: tudo fica flutuando
+
+  for (const o of objects) {
+    o.mesh.position.set(o.body.position.x, o.body.position.y, o.body.position.z);
+    o.mesh.quaternion.set(o.body.quaternion.x, o.body.quaternion.y, o.body.quaternion.z, o.body.quaternion.w);
+  }
+  renderer.render(scene, camera);
+}
+
+/* ---------- Início (precisa de toque do usuário para câmera e sensores) ---------- */
+async function initHands() {
+  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  const make = delegate => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 1
+  });
+  try { handLandmarker = await make("GPU"); } catch { handLandmarker = await make("CPU"); }
+}
+
+$("startBtn").onclick = async () => {
+  try {
+    if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r === "granted") addEventListener("deviceorientation", onOrient, true);
+    } else addEventListener("deviceorientation", onOrient, true);
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+    });
+    video.srcObject = stream; await video.play();
+    $("start").style.display = "none";
+    resize(); loop();
+    setStatus("Carregando rastreamento de mão…");
+    await initHands();
+    setStatus("Pronto! Mostre a mão para a câmera.");
+  } catch (err) {
+    $("start").style.display = "flex";
+    $("start").querySelector("p").textContent = "Erro: " + (err && err.message ? err.message : err) +
+      ". Abra pelo endereço https:// no Safari e permita câmera e movimento.";
+  }
+};
+</script>
+</body>
+</html>
